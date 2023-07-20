@@ -1,0 +1,1 @@
+cog train -i train_data=https://storage.googleapis.com/dan-scratch-public/datasets/guanaco.jsonl -i num_train_epochs=1 -i train_batch_size=8 -i lora_target_modules="q_proj,v_proj" -i gradient_accumulation_steps=2 -i max_steps=1

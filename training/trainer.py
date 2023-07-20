@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import pickle
 import time
 import logging
 from collections import OrderedDict
@@ -10,6 +11,7 @@ from typing import List, Optional, Union
 import torch
 from cog import Input, Path
 from peft import (LoraConfig, get_peft_model)
+from peft.utils import get_peft_model_state_dict, PromptLearningConfig
 from torch.utils.data import Dataset
 from transformers import LlamaForCausalLM, Trainer, TrainingArguments, AutoConfig
 from tensorizer import TensorDeserializer
@@ -24,6 +26,7 @@ CHECKPOINT_DIR = "checkpoints"
 SAVE_STRATEGY = "epoch"
 DIST_OUT_DIR = "tmp/model"
 IGNORE_INDEX = -100
+WEIGHTS_NAME = 'adapter_model.bin'
 
 
 class DatasetBuilder:
@@ -170,20 +173,6 @@ def load_model(model_name_or_path):
     model = load_tensorizer(model_name_or_path, plaid_mode=False, cls=LlamaForCausalLM)
     return model
 
-def print_trainable_parameters(model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
-    )
-
 def load_peft_model(
     model_name_or_path, lora_rank: int, lora_alpha: int, lora_dropout: float, lora_target_modules: Optional[Union[List[str], str]]
 ):
@@ -203,9 +192,79 @@ def load_peft_model(
     )
     print(f"LoRA config: {config}")
     model = get_peft_model(model, config)
-    print_trainable_parameters(model)
+    model.print_trainable_parameters()
     model.config.use_cache = False # required for gradient checkpointing
     return model
+
+
+def overwrite_save(model, save_directory, selected_adapters=None):
+    """Debugging why model.save fails after training"""
+    if os.path.isfile(save_directory):
+        raise ValueError(f"Provided path ({save_directory}) should be a directory, not a file")
+
+    if selected_adapters is None:
+        selected_adapters = list(model.peft_config.keys())
+    else:
+        if any(
+            selected_adapter_name not in list(model.peft_config.keys())
+            for selected_adapter_name in selected_adapters
+        ):
+            raise ValueError(
+                f"You passed an invalid `selected_adapters` arguments, current supported adapter names are"
+                f" {list(model.peft_config.keys())} - got {selected_adapters}."
+            )
+
+    os.makedirs(save_directory, exist_ok=True)
+    model.create_or_update_model_card(save_directory)
+    print("len selected adapters:", len(selected_adapters))
+    print(selected_adapters)
+    for adapter_name in selected_adapters:
+        peft_config = model.peft_config[adapter_name]
+        # save only the trainable weights
+        output_state_dict = get_peft_model_state_dict(
+            model, state_dict=None, adapter_name=adapter_name
+        )
+
+        output_dir = os.path.join(save_directory, adapter_name) if adapter_name != "default" else save_directory
+        with open(os.path.join(output_dir, 'pickled_dict.pkl'), 'wb') as f:
+            pickle.dump(output_state_dict, f)
+        os.makedirs(output_dir, exist_ok=True)
+
+        # if safe_serialization:
+        #     safe_save_file(
+        #         output_state_dict,
+        #         os.path.join(output_dir, SAFETENSORS_WEIGHTS_NAME),
+        #         metadata={"format": "pt"},
+        #     )
+        # else:
+        torch.save(output_state_dict, os.path.join(output_dir, WEIGHTS_NAME))
+
+        # save the config and change the inference mode to `True`
+        if peft_config.base_model_name_or_path is None:
+            peft_config.base_model_name_or_path = (
+                model.base_model.__dict__.get("name_or_path", None)
+                if isinstance(peft_config, PromptLearningConfig)
+                else model.base_model.model.__dict__.get("name_or_path", None)
+            )
+        inference_mode = peft_config.inference_mode
+        peft_config.inference_mode = True
+
+        if peft_config.task_type is None:
+            # deal with auto mapping
+            base_model_class = model._get_base_model_class(
+                is_prompt_tuning=isinstance(peft_config, PromptLearningConfig)
+            )
+            parent_library = base_model_class.__module__
+
+            auto_mapping_dict = {
+                "base_model_class": base_model_class.__name__,
+                "parent_library": parent_library,
+            }
+        else:
+            auto_mapping_dict = None
+
+        peft_config.save_pretrained(output_dir, auto_mapping_dict=auto_mapping_dict)
+        peft_config.inference_mode = inference_mode
 
 
 def train(
@@ -281,7 +340,7 @@ def train(
 
     torch.cuda.empty_cache()
     torch.set_float32_matmul_precision("high")
-
+    overwrite_save(model, "initial")
 
     print("Training...")
     trainer = Trainer(
@@ -310,7 +369,8 @@ def train(
     )
     trainer.train()
     print("model saving!")
-    model.save_pretrained(local_output_dir)
+    trainer.model.print_trainable_parameters()
+    overwrite_save(model, local_output_dir)
     return
 
 
